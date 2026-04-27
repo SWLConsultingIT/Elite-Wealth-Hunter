@@ -42,23 +42,67 @@ def safe_delay(min_s=2, max_s=5):
     time.sleep(random.uniform(min_s, max_s))
 
 
-def fetch_hashtag_sections(hashtag: str, max_id: str = None):
-    headers = {**make_headers(), "Content-Type": "application/x-www-form-urlencoded"}
+def fetch_hashtag_sections(hashtag: str, max_id: str = None, tab: str = "top"):
+    session = get_session()
+    headers = {
+        **make_headers(),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
+    }
     data = {
-        "tab": "recent",
+        "tab": tab,
         "page": 1,
         "surface": "explore_media_grid",
         "include_persistent": "true",
+        "_uuid": str(uuid.uuid4()),
+        "_uid": session.get("ds_user_id", ""),
     }
     if max_id:
         data["max_id"] = max_id
 
     url = f"https://www.instagram.com/api/v1/tags/{hashtag}/sections/"
 
-    with httpx.Client(headers=headers, cookies=get_session(), timeout=30, follow_redirects=True) as client:
+    with httpx.Client(headers=headers, cookies=session, timeout=30, follow_redirects=True) as client:
         resp = client.post(url, data=data)
         resp.raise_for_status()
         return resp.json()
+
+
+@app.route("/debug_hashtag", methods=["POST"])
+def debug_hashtag():
+    """Returns raw IG API response for debugging"""
+    data = request.json or {}
+    hashtag = data.get("hashtag", "yachtlife").replace("#", "")
+    tab = data.get("tab", "top")
+    session = get_session()
+    headers = {
+        **make_headers(),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
+    }
+    post_data = {
+        "tab": tab,
+        "page": 1,
+        "surface": "explore_media_grid",
+        "include_persistent": "true",
+        "_uuid": str(uuid.uuid4()),
+        "_uid": session.get("ds_user_id", ""),
+    }
+    url = f"https://www.instagram.com/api/v1/tags/{hashtag}/sections/"
+    try:
+        with httpx.Client(headers=headers, cookies=session, timeout=30, follow_redirects=True) as client:
+            resp = client.post(url, data=post_data)
+            return jsonify({
+                "status_code": resp.status_code,
+                "url": str(resp.url),
+                "response": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:2000],
+            })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 def fetch_user_info(user_id: str):
