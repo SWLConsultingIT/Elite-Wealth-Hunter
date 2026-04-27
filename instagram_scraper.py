@@ -1,246 +1,262 @@
-import instaloader
-import json
+import httpx
 import time
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import os
 import random
 import logging
+import os
+import uuid
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
-# Initialize instaloader with optimal settings
-L = instaloader.Instaloader(
-    download_videos=False,
-    download_video_thumbnails=False,
-    download_geotags=False,
-    download_comments=False,
-    save_metadata=False,
-    compress_json=False,
-    post_metadata_txt_pattern='',
-    storyitem_metadata_txt_pattern=''
-)
+IG_APP_ID = "936619743392459"
 
-def safe_delay():
-    """Random delay to avoid rate limits"""
-    delay = random.uniform(2, 5)
-    time.sleep(delay)
 
-@app.route('/', methods=['GET'])
+def get_session():
+    return {
+        "sessionid": os.environ.get("IG_SESSION_ID", ""),
+        "ds_user_id": os.environ.get("IG_DS_USER_ID", ""),
+        "csrftoken": os.environ.get("IG_CSRF_TOKEN", ""),
+        "ig_did": os.environ.get("IG_DID", str(uuid.uuid4()).upper()),
+    }
+
+
+def make_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "x-ig-app-id": IG_APP_ID,
+        "x-csrftoken": os.environ.get("IG_CSRF_TOKEN", ""),
+        "Referer": "https://www.instagram.com/",
+        "Origin": "https://www.instagram.com",
+    }
+
+
+def safe_delay(min_s=2, max_s=5):
+    time.sleep(random.uniform(min_s, max_s))
+
+
+def fetch_hashtag_sections(hashtag: str, max_id: str = None):
+    headers = {**make_headers(), "Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "tab": "recent",
+        "page": 1,
+        "surface": "explore_media_grid",
+        "include_persistent": "true",
+    }
+    if max_id:
+        data["max_id"] = max_id
+
+    url = f"https://www.instagram.com/api/v1/tags/{hashtag}/sections/"
+
+    with httpx.Client(headers=headers, cookies=get_session(), timeout=30, follow_redirects=True) as client:
+        resp = client.post(url, data=data)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def fetch_user_info(user_id: str):
+    url = f"https://i.instagram.com/api/v1/users/{user_id}/info/"
+    with httpx.Client(headers=make_headers(), cookies=get_session(), timeout=30, follow_redirects=True) as client:
+        resp = client.get(url)
+        if resp.status_code == 200:
+            return resp.json().get("user", {})
+    return None
+
+
+def extract_posts(sections_data):
+    posts = []
+    for section in sections_data.get("sections", []):
+        for item in section.get("layout_content", {}).get("medias", []):
+            media = item.get("media", {})
+            if media:
+                posts.append(media)
+    return posts
+
+
+def build_profile(user_data: dict, source_hashtag: str = "") -> dict:
+    return {
+        "username": user_data.get("username", ""),
+        "fullName": user_data.get("full_name", ""),
+        "biography": user_data.get("biography", ""),
+        "followersCount": user_data.get("follower_count", 0),
+        "followingCount": user_data.get("following_count", 0),
+        "postsCount": user_data.get("media_count", 0),
+        "isVerified": user_data.get("is_verified", False),
+        "isPrivate": user_data.get("is_private", False),
+        "isBusinessAccount": user_data.get("is_business", False),
+        "profilePicture": user_data.get("profile_pic_url", ""),
+        "externalUrl": user_data.get("external_url", "") or "",
+        "category": user_data.get("category", "") or "",
+        "scrapedAt": int(time.time()),
+        "sourceHashtag": source_hashtag,
+    }
+
+
+def build_profile_from_post_user(user_basic: dict, source_hashtag: str = "") -> dict:
+    return {
+        "username": user_basic.get("username", ""),
+        "fullName": user_basic.get("full_name", ""),
+        "biography": "",
+        "followersCount": 0,
+        "followingCount": 0,
+        "postsCount": 0,
+        "isVerified": user_basic.get("is_verified", False),
+        "isPrivate": user_basic.get("is_private", False),
+        "isBusinessAccount": False,
+        "profilePicture": user_basic.get("profile_pic_url", ""),
+        "externalUrl": "",
+        "category": "",
+        "scrapedAt": int(time.time()),
+        "sourceHashtag": source_hashtag,
+    }
+
+
+def scrape_hashtag_internal(hashtag: str, limit: int, seen_usernames: set) -> list:
+    profiles = []
+    max_id = None
+    errors = 0
+
+    while len(profiles) < limit:
+        try:
+            result = fetch_hashtag_sections(hashtag, max_id)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if status == 429:
+                logger.warning("Rate limited — sleeping 60s")
+                time.sleep(60)
+                continue
+            if status in (401, 403):
+                logger.error("Session expired or invalid")
+                break
+            errors += 1
+            if errors > 3:
+                break
+            safe_delay(5, 10)
+            continue
+        except Exception as e:
+            logger.error(f"Request error: {e}")
+            errors += 1
+            if errors > 3:
+                break
+            continue
+
+        posts = extract_posts(result)
+        if not posts:
+            break
+
+        for post in posts:
+            if len(profiles) >= limit:
+                break
+
+            user_basic = post.get("user", {})
+            username = user_basic.get("username", "")
+            user_id = str(user_basic.get("pk", ""))
+
+            if not username or username in seen_usernames:
+                continue
+            if user_basic.get("is_private"):
+                continue
+
+            seen_usernames.add(username)
+
+            safe_delay()
+            user_data = fetch_user_info(user_id)
+
+            profile = (
+                build_profile(user_data, hashtag)
+                if user_data
+                else build_profile_from_post_user(user_basic, hashtag)
+            )
+            profiles.append(profile)
+            logger.info(f"✓ {len(profiles)}/{limit}: @{username}")
+
+        if not result.get("more_available") or not result.get("next_max_id"):
+            break
+        max_id = result["next_max_id"]
+        safe_delay(3, 6)
+
+    return profiles
+
+
+@app.route("/", methods=["GET"])
 def health_check():
+    session_ok = bool(os.environ.get("IG_SESSION_ID"))
     return jsonify({
-        "status": "Free Instagram Scraper API",
-        "version": "1.0",
+        "status": "Instagram GraphQL Scraper",
+        "version": "2.0",
+        "session_configured": session_ok,
         "endpoints": ["/scrape_hashtag", "/scrape_multiple"],
-        "author": "Elite Wealth Hunter"
     })
 
-@app.route('/scrape_hashtag', methods=['POST'])
+
+@app.route("/scrape_hashtag", methods=["POST"])
 def scrape_hashtag():
     try:
         data = request.json or {}
-        hashtag = data.get('hashtag', 'yachtlife').replace('#', '')
-        limit = min(int(data.get('limit', 50)), 100)  # Max 100 for safety
-        
-        logger.info(f"Starting scrape: #{hashtag}, limit: {limit}")
-        
-        profiles = []
-        seen_usernames = set()
-        errors = 0
-        
-        try:
-            hashtag_obj = instaloader.Hashtag.from_name(L.context, hashtag)
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': f'Hashtag not found: {hashtag}',
-                'profiles': []
-            }), 404
-        
-        for i, post in enumerate(hashtag_obj.get_posts()):
-            if len(profiles) >= limit:
-                break
-                
-            if i >= limit * 2:  # Safety break
-                break
-            
-            try:
-                username = post.owner_username
-                
-                # Skip duplicates
-                if username in seen_usernames:
-                    continue
-                    
-                seen_usernames.add(username)
-                
-                # Get profile details
-                profile = post.owner_profile
-                
-                # Skip private profiles for better data quality
-                if profile.is_private:
-                    continue
-                
-                # Get recent posts (limit 3 for efficiency)
-                recent_posts = []
-                try:
-                    post_count = 0
-                    for recent_post in profile.get_posts():
-                        if post_count >= 3:
-                            break
-                        recent_posts.append({
-                            'shortcode': recent_post.shortcode,
-                            'caption': recent_post.caption[:300] if recent_post.caption else '',
-                            'likesCount': recent_post.likes,
-                            'commentsCount': recent_post.comments,
-                            'displayUrl': recent_post.url,
-                            'timestamp': recent_post.date.isoformat(),
-                            'locationName': recent_post.location.name if recent_post.location else ''
-                        })
-                        post_count += 1
-                except:
-                    pass  # If can't get posts, continue with profile
-                
-                # Build profile object
-                profile_data = {
-                    'username': username,
-                    'fullName': profile.full_name or '',
-                    'biography': profile.biography or '',
-                    'followersCount': profile.followers,
-                    'followingCount': profile.followees,
-                    'postsCount': profile.mediacount,
-                    'isVerified': profile.is_verified,
-                    'isPrivate': profile.is_private,
-                    'isBusinessAccount': profile.is_business_account,
-                    'profilePicture': profile.profile_pic_url,
-                    'externalUrl': profile.external_url or '',
-                    'latestPosts': recent_posts,
-                    'location': '',
-                    'scrapedAt': int(time.time()),
-                    'sourceHashtag': hashtag
-                }
-                
-                profiles.append(profile_data)
-                logger.info(f"✓ Scraped {len(profiles)}/{limit}: @{username}")
-                
-                # Rate limiting
-                safe_delay()
-                
-            except Exception as e:
-                errors += 1
-                logger.warning(f"Error with post {i}: {str(e)}")
-                if errors > 10:  # Too many errors, stop
-                    break
-                continue
-        
-        result = {
-            'success': True,
-            'hashtag': hashtag,
-            'requested_limit': limit,
-            'profiles_found': len(profiles),
-            'profiles': profiles,
-            'timestamp': int(time.time()),
-            'errors_encountered': errors
-        }
-        
-        logger.info(f"✅ Completed: {len(profiles)} profiles scraped from #{hashtag}")
-        return jsonify(result)
-        
-    except Exception as e:
-        error_msg = f"Scraping error: {str(e)}"
-        logger.error(error_msg)
-        return jsonify({
-            'success': False,
-            'error': error_msg,
-            'profiles': []
-        }), 500
+        hashtag = data.get("hashtag", "yachtlife").replace("#", "")
+        limit = min(int(data.get("limit", 50)), 100)
 
-@app.route('/scrape_multiple', methods=['POST'])
-def scrape_multiple_hashtags():
-    """Scrape multiple hashtags in one call"""
+        if not os.environ.get("IG_SESSION_ID"):
+            return jsonify({"success": False, "error": "IG_SESSION_ID env var not set"}), 500
+
+        logger.info(f"Scraping #{hashtag}, limit: {limit}")
+        profiles = scrape_hashtag_internal(hashtag, limit, set())
+
+        return jsonify({
+            "success": True,
+            "hashtag": hashtag,
+            "profiles_found": len(profiles),
+            "profiles": profiles,
+            "timestamp": int(time.time()),
+        })
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return jsonify({"success": False, "error": str(e), "profiles": []}), 500
+
+
+@app.route("/scrape_multiple", methods=["POST"])
+def scrape_multiple():
     try:
         data = request.json or {}
-        hashtags = data.get('hashtags', ['yachtlife'])
-        limit_per_hashtag = min(int(data.get('limit_per_hashtag', 20)), 30)
-        
+        hashtags = data.get("hashtags", ["yachtlife"])
+        limit_per = min(int(data.get("limit_per_hashtag", 20)), 30)
+
+        if not os.environ.get("IG_SESSION_ID"):
+            return jsonify({"success": False, "error": "IG_SESSION_ID env var not set"}), 500
+
         all_profiles = []
-        seen_usernames = set()
-        
+        seen = set()
+
         for hashtag in hashtags:
+            hashtag = hashtag.replace("#", "")
             logger.info(f"Scraping #{hashtag}")
-            
-            # Internal call to single hashtag scraper
-            hashtag_profiles = scrape_single_hashtag(hashtag, limit_per_hashtag, seen_usernames)
-            all_profiles.extend(hashtag_profiles)
-            
-            # Update seen usernames
-            for profile in hashtag_profiles:
-                seen_usernames.add(profile['username'])
-            
-            # Delay between hashtags
-            time.sleep(random.uniform(3, 6))
-        
+            profiles = scrape_hashtag_internal(hashtag, limit_per, seen)
+            all_profiles.extend(profiles)
+            for p in profiles:
+                seen.add(p["username"])
+            time.sleep(random.uniform(5, 10))
+
         return jsonify({
-            'success': True,
-            'hashtags_scraped': hashtags,
-            'total_profiles': len(all_profiles),
-            'profiles': all_profiles,
-            'timestamp': int(time.time())
+            "success": True,
+            "hashtags_scraped": hashtags,
+            "total_profiles": len(all_profiles),
+            "profiles": all_profiles,
+            "timestamp": int(time.time()),
         })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'profiles': []
-        }), 500
 
-def scrape_single_hashtag(hashtag, limit, seen_usernames):
-    """Helper function for single hashtag scraping"""
-    profiles = []
-    hashtag = hashtag.replace('#', '')
-    
-    try:
-        hashtag_obj = instaloader.Hashtag.from_name(L.context, hashtag)
-        
-        for i, post in enumerate(hashtag_obj.get_posts()):
-            if len(profiles) >= limit or i >= limit * 2:
-                break
-                
-            username = post.owner_username
-            if username in seen_usernames:
-                continue
-                
-            try:
-                profile = post.owner_profile
-                if profile.is_private:
-                    continue
-                
-                profile_data = {
-                    'username': username,
-                    'fullName': profile.full_name or '',
-                    'biography': profile.biography or '',
-                    'followersCount': profile.followers,
-                    'followingCount': profile.followees,
-                    'isVerified': profile.is_verified,
-                    'sourceHashtag': hashtag
-                }
-                
-                profiles.append(profile_data)
-                safe_delay()
-                
-            except:
-                continue
-                
     except Exception as e:
-        logger.error(f"Error scraping #{hashtag}: {str(e)}")
-    
-    return profiles
+        logger.error(f"Error: {e}")
+        return jsonify({"success": False, "error": str(e), "profiles": []}), 500
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)

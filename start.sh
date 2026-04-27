@@ -1,4 +1,3 @@
 #!/bin/bash
-# start.sh
 pip install -r requirements.txt
-python instagram_scraper.py
+gunicorn instagram_scraper:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300
